@@ -22,6 +22,7 @@ type ReconnectingSocket struct {
 	logger  *Logger
 
 	// Internal state
+	ctx       context.Context
 	requested atomic.Bool
 	conn      atomic.Pointer[websocket.Conn]
 	start     chan struct{}
@@ -38,6 +39,7 @@ func NewReconnectingSocket(ctx context.Context, logger *Logger, dialer websocket
 	w := &ReconnectingSocket{
 		Read:      make(chan []byte),
 		Write:     make(chan []byte),
+		ctx:       ctx,
 		dialer:    dialer,
 		url:       url,
 		headers:   headers,
@@ -81,8 +83,16 @@ func NewReconnectingSocket(ctx context.Context, logger *Logger, dialer websocket
 				return
 			case <-time.After(reconnectInterval):
 				if !w.Connected() && w.requested.Load() {
-					w.start <- struct{}{}
-					<-w.startWait
+					select {
+					case w.start <- struct{}{}:
+					case <-ctx.Done():
+						return
+					}
+					select {
+					case <-w.startWait:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}
@@ -99,11 +109,25 @@ func (w *ReconnectingSocket) Connected() bool {
 // Does nothing if the WebSocket is already connected
 func (w *ReconnectingSocket) Connect() error {
 	w.requested.Store(true)
-	if !w.Connected() {
-		w.start <- struct{}{}
-		return <-w.startWait
+	if w.Connected() {
+		return nil
 	}
-	return nil
+	// Select on the context here so we don't block forever if the manager
+	// goroutine has already exited on its <-ctx.Done() branch (e.g. during a
+	// SIGHUP config reload). Once the context is canceled the manager won't
+	// answer on startWait, so any subsequent caller also returns via ctx.Done()
+	// and never consumes a stale reply.
+	select {
+	case w.start <- struct{}{}:
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
+	select {
+	case err := <-w.startWait:
+		return err
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
 }
 
 // Disconnect - Shuts down the WebSocket connection
