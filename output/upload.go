@@ -1,8 +1,6 @@
 package output
 
 import (
-	"bytes"
-	"compress/zlib"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +9,6 @@ import (
 
 	"github.com/pganalyze/collector/state"
 	"github.com/pganalyze/collector/util"
-	"google.golang.org/protobuf/proto"
 )
 
 func SetupSnapshotUploadForAllServers(ctx context.Context, servers []*state.Server, opts state.CollectionOpts, logger *util.Logger) {
@@ -26,40 +23,58 @@ func SetupSnapshotUploadForAllServers(ctx context.Context, servers []*state.Serv
 func snapshotUploadForServer(ctx context.Context, server *state.Server, logger *util.Logger, testRun bool) {
 	var compactLogTime time.Time
 	compactLogStats := make(map[string]uint8)
+	var failed bool
+	var delay time.Duration
+
 	for {
+		if failed {
+			// If the last snapshot submission failed, use an increasing backoff delay
+			delay = min(5*delay, 10*time.Second)
+		} else {
+			// Default delay to avoid high CPU usage from looping continuously
+			delay = 10 * time.Millisecond
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case s := <-server.FullSnapshotUpload:
-			data, err := proto.Marshal(s)
-			if err != nil {
-				logger.PrintError("Error marshaling protocol buffers")
-				continue
-			}
+		case <-time.After(delay):
+		}
 
-			err = uploadViaWebsocketOrHttp(ctx, server, logger, testRun, data, s.SnapshotUuid, s.CollectedAt.AsTime(), false)
+		popCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
+		tx, err := server.FullSnapshotQueue.Pop(popCtx)
+		cancel()
+		if err == nil {
+			err = uploadViaWebsocketOrHttp(ctx, server, logger, testRun, tx.Snapshot)
 			if err != nil {
-				logger.PrintError("Error uploading snapshot: %s", err)
-			} else if !testRun {
-				logger.PrintInfo("Submitted full snapshot successfully")
+				logger.PrintError("Error uploading full snapshot: %s", err)
+				tx.Rollback()
+				failed = true
+			} else {
+				tx.Commit()
+				if !testRun {
+					logger.PrintInfo("Submitted full snapshot successfully")
+				}
+				failed = false
 			}
-		case s := <-server.CompactSnapshotUpload:
-			data, err := proto.Marshal(s)
-			if err != nil {
-				logger.PrintError("Error marshaling protocol buffers")
-				continue
-			}
+		}
 
-			err = uploadViaWebsocketOrHttp(ctx, server, logger, testRun, data, s.SnapshotUuid, s.CollectedAt.AsTime(), false)
+		popCtx, cancel = context.WithTimeout(ctx, time.Millisecond)
+		tx, err = server.CompactSnapshotQueue.Pop(popCtx)
+		cancel()
+		if err == nil {
+			kind := tx.Kind
+			err = uploadViaWebsocketOrHttp(ctx, server, logger, testRun, tx.Snapshot)
 			if err != nil {
-				logger.PrintError("Error uploading snapshot: %s", err)
+				logger.PrintError("Error uploading compact snapshot: %s", err)
+				tx.Rollback()
+				failed = true
+			} else {
+				tx.Commit()
+				failed = false
+			}
+			if err != nil || testRun {
 				continue
 			}
-			if testRun {
-				continue
-			}
-
-			kind := kindFromCompactSnapshot(s)
 			logger.PrintVerbose("Submitted compact %s snapshot successfully", kind)
 			compactLogStats[kind] = compactLogStats[kind] + 1
 			if compactLogTime.IsZero() {
@@ -92,23 +107,14 @@ func summarizeCounts(counts map[string]uint8) string {
 	return details
 }
 
-func uploadViaWebsocketOrHttp(ctx context.Context, server *state.Server, logger *util.Logger, testRun bool, data []byte, snapshotUUID string, collectedAt time.Time, compactSnapshot bool) error {
-	var compressedData bytes.Buffer
-	w := zlib.NewWriter(&compressedData)
-	w.Write(data)
-	w.Close()
-
+func uploadViaWebsocketOrHttp(ctx context.Context, server *state.Server, logger *util.Logger, testRun bool, data []byte) error {
 	if server.WebSocket.Connected() {
 		logger.PrintVerbose("Uploading snapshot to websocket")
-		server.WebSocket.Write <- compressedData.Bytes()
+		server.WebSocket.Write <- data
 	} else if server.Config.APIRequireWebsocket {
 		return errors.New("Error uploading snapshot: WebSocket not connected")
 	} else {
-		s3Location, err := uploadSnapshot(ctx, server.Config.HTTPClientWithRetry, server.Grant.Load(), logger, compressedData.Bytes(), snapshotUUID)
-		if err != nil {
-			return err
-		}
-		submitSnapshot(ctx, server, testRun, logger, s3Location, collectedAt, compactSnapshot)
+		return uploadSnapshot(ctx, server.Config.HTTPClient, server.Grant.Load(), logger, data)
 	}
 	return nil
 }

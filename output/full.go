@@ -2,6 +2,7 @@ package output
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/pganalyze/collector/state"
 	"github.com/pganalyze/collector/util"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -65,7 +67,16 @@ func submitFull(ctx context.Context, s *snapshot.FullSnapshot, server *state.Ser
 		return nil
 	}
 
-	server.FullSnapshotUpload <- s
+	data, err := proto.Marshal(s)
+	if err != nil {
+		return err
+	}
+	var compressedData bytes.Buffer
+	w := zlib.NewWriter(&compressedData)
+	w.Write(data)
+	w.Close()
+
+	server.FullSnapshotQueue.Push("full", compressedData.Bytes())
 
 	return nil
 }

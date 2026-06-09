@@ -304,8 +304,8 @@ type Server struct {
 
 	SelfTest *SelfTestResult
 
-	FullSnapshotUpload    chan *pganalyze_collector.FullSnapshot
-	CompactSnapshotUpload chan *pganalyze_collector.CompactSnapshot
+	FullSnapshotQueue     *Queue
+	CompactSnapshotQueue  *Queue
 	WebSocket             *util.ReconnectingSocket
 	InitialConfigReceived chan struct{}
 	Pause                 atomic.Bool
@@ -339,8 +339,8 @@ func MakeServer(config config.ServerConfig, testRun bool) *Server {
 		ActivityStateMutex:    &sync.Mutex{},
 		HighFreqStateMutex:    &sync.Mutex{},
 		CollectionStatusMutex: &sync.Mutex{},
-		FullSnapshotUpload:    make(chan *pganalyze_collector.FullSnapshot),
-		CompactSnapshotUpload: make(chan *pganalyze_collector.CompactSnapshot),
+		FullSnapshotQueue:     NewQueue(),
+		CompactSnapshotQueue:  NewQueue(),
 		InitialConfigReceived: make(chan struct{}, 1),
 		QueryRuns:             make(map[int64]*QueryRun),
 		QueryRunsMutex:        &sync.Mutex{},

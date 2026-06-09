@@ -2,6 +2,7 @@ package output
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/pganalyze/collector/state"
 	"github.com/pganalyze/collector/util"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -39,7 +41,17 @@ func uploadAndSubmitCompactSnapshot(ctx context.Context, s *pganalyze_collector.
 		return nil
 	}
 
-	server.CompactSnapshotUpload <- s
+	kind := kindFromCompactSnapshot(s)
+	data, err := proto.Marshal(s)
+	if err != nil {
+		return err
+	}
+	var compressedData bytes.Buffer
+	w := zlib.NewWriter(&compressedData)
+	w.Write(data)
+	w.Close()
+
+	server.CompactSnapshotQueue.Push(kind, compressedData.Bytes())
 
 	return nil
 }
